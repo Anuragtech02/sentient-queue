@@ -91,9 +91,9 @@ redis.on("error", (err) => {
 });
 
 // Middleware setup
-// app.use(express.json({ limit: "10kb" })); // Limit payload size
-// app.use(helmet()); // Security headers
-// app.use(compression()); // Compress responses
+app.use(express.json({ limit: "10kb" })); // Limit payload size
+app.use(helmet()); // Security headers
+app.use(compression()); // Compress responses
 
 // CORS configuration
 app.use(
@@ -127,20 +127,10 @@ app.use(
 // app.use(limiter);
 
 // Request timeout middleware
-// app.use((req, res, next) => {
-//   res.setTimeout(CONSTANTS.REQUEST_TIMEOUT, () => {
-//     logger.error("Request timeout", { path: req.path, ip: getClientIP(req) });
-//     res.status(408).json({ error: "Request timeout" });
-//   });
-//   next();
-// });
-
 app.use((req, res, next) => {
-  logger.info(`Incoming request`, {
-    method: req.method,
-    path: req.path,
-    ip: getClientIP(req),
-    headers: req.headers,
+  res.setTimeout(CONSTANTS.REQUEST_TIMEOUT, () => {
+    logger.error("Request timeout", { path: req.path, ip: getClientIP(req) });
+    res.status(408).json({ error: "Request timeout" });
   });
   next();
 });
@@ -407,23 +397,6 @@ app.post("/api/queue/deactivate", validateQueueCheck, async (req, res) => {
     });
     res.status(500).json({ error: "Internal server error" });
   }
-});
-
-app.use((err, req, res, next) => {
-  logger.error("Unhandled error", {
-    error: err.message,
-    stack: err.stack,
-    path: req.path,
-    method: req.method,
-    ip: getClientIP(req),
-  });
-
-  res.status(500).json({
-    error:
-      process.env.NODE_ENV === "production"
-        ? "Internal server error"
-        : err.message,
-  });
 });
 
 const gracefulShutdown = async (signal) => {
