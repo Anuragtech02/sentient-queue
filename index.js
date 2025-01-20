@@ -38,17 +38,17 @@ const logger = winston.createLogger({
         winston.format.simple()
       ),
     }),
-    new winston.transports.File({
-      filename: "logs/error.log",
-      level: "error",
-      maxsize: 5242880, // 5MB
-      maxFiles: 5,
-    }),
-    new winston.transports.File({
-      filename: "logs/combined.log",
-      maxsize: 5242880, // 5MB
-      maxFiles: 5,
-    }),
+    // new winston.transports.File({
+    //   filename: "logs/error.log",
+    //   level: "error",
+    //   maxsize: 5242880, // 5MB
+    //   maxFiles: 5,
+    // }),
+    // new winston.transports.File({
+    //   filename: "logs/combined.log",
+    //   maxsize: 5242880, // 5MB
+    //   maxFiles: 5,
+    // }),
   ],
 });
 
@@ -91,9 +91,9 @@ redis.on("error", (err) => {
 });
 
 // Middleware setup
-app.use(express.json({ limit: "10kb" })); // Limit payload size
-app.use(helmet()); // Security headers
-app.use(compression()); // Compress responses
+// app.use(express.json({ limit: "10kb" })); // Limit payload size
+// app.use(helmet()); // Security headers
+// app.use(compression()); // Compress responses
 
 // CORS configuration
 app.use(
