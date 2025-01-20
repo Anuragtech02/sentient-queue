@@ -1,33 +1,64 @@
-// server.ts
+// server.js
 import express from "express";
 import Redis from "ioredis";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { configDotenv } from "dotenv";
+import { config as configDotenv } from "dotenv";
+import winston from "winston";
 
+// Initialize environment variables
 configDotenv();
 
+// Configure Winston logger
+const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || "info",
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      ),
+    }),
+    new winston.transports.File({
+      filename: "error.log",
+      level: "error",
+    }),
+    new winston.transports.File({
+      filename: "combined.log",
+    }),
+  ],
+});
+
+// Constants
+const CONSTANTS = {
+  PORT: process.env.PORT || 8001,
+  QUEUE_KEY: "ip_queue",
+  ACTIVE_IPS_KEY: "active_ips",
+  MAX_ACTIVE_USERS: Number(process.env.MAX_ACTIVE_USERS) || 500,
+  QUEUE_TIMEOUT: 300, // 5 minutes in seconds
+  CLEANUP_INTERVAL: 60000, // 1 minute in milliseconds
+  ESTIMATE_PER_POSITION: 30, // 30 seconds per position
+};
+
+// Express app initialization
 const app = express();
-const port = process.env.PORT || 8001;
 
 // Redis setup
 const redis = new Redis(process.env.REDIS_URL || "");
 
 redis.on("connect", () => {
-  console.log("Successfully connected to Redis");
+  logger.info("Successfully connected to Redis");
 });
 
 redis.on("error", (err) => {
-  console.error("Redis connection error:", err);
+  logger.error("Redis connection error", { error: err.message });
 });
 
-// Constants
-const QUEUE_KEY = "ip_queue";
-const ACTIVE_IPS_KEY = "active_ips";
-const MAX_ACTIVE_USERS = 400;
-const QUEUE_TIMEOUT = 300; // 5 minutes
-
-// Middleware
+// Middleware setup
 app.use(express.json());
 app.use(
   cors({
@@ -38,78 +69,146 @@ app.use(
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
+  windowMs: 60 * 1000, // 1 minute
   max: 30, // 30 requests per minute
+  handler: (req, res) => {
+    logger.warn("Rate limit exceeded", {
+      ip: req.ip,
+      path: req.path,
+    });
+    res.status(429).json({
+      error: "Too many requests, please try again later",
+    });
+  },
 });
 
 app.use(limiter);
 
+// Helper functions
+const getClientIP = (req) => {
+  return req.ip || req.headers["x-forwarded-for"] || "unknown";
+};
+
 // Queue management endpoints
 app.post("/api/queue/check", async (req, res) => {
+  const ip = getClientIP(req);
+
   try {
-    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+    logger.info("Checking queue position", { ip });
 
     // Check if IP is already active
-    const isActive = await redis.sismember(ACTIVE_IPS_KEY, ip);
+    const isActive = await redis.sismember(CONSTANTS.ACTIVE_IPS_KEY, ip);
     if (isActive) {
+      logger.debug("IP already active", { ip });
       return res.json({ position: 0 });
     }
 
-    const activeUsers = await redis.scard(ACTIVE_IPS_KEY);
+    const activeUsers = await redis.scard(CONSTANTS.ACTIVE_IPS_KEY);
 
-    if (activeUsers < MAX_ACTIVE_USERS) {
-      await redis.sadd(ACTIVE_IPS_KEY, ip);
-      await redis.expire(ACTIVE_IPS_KEY, QUEUE_TIMEOUT);
+    if (activeUsers < CONSTANTS.MAX_ACTIVE_USERS) {
+      await redis.sadd(CONSTANTS.ACTIVE_IPS_KEY, ip);
+      await redis.expire(CONSTANTS.ACTIVE_IPS_KEY, CONSTANTS.QUEUE_TIMEOUT);
+      logger.info("New user added to active users", { ip });
       return res.json({ position: 0 });
     }
 
     // Add to queue
-    await redis.zadd(QUEUE_KEY, Date.now(), ip);
-    const position = await redis.zrank(QUEUE_KEY, ip);
+    await redis.zadd(CONSTANTS.QUEUE_KEY, Date.now(), ip);
+    const position = await redis.zrank(CONSTANTS.QUEUE_KEY, ip);
 
-    res.json({
+    const response = {
       position: position || 0,
-      estimatedWaitTime: (position || 0) * 30, // 30 seconds per position
+      estimatedWaitTime: (position || 0) * CONSTANTS.ESTIMATE_PER_POSITION,
+    };
+
+    logger.info("User added to queue", {
+      ip,
+      position: response.position,
+      estimatedWait: response.estimatedWaitTime,
     });
+
+    res.json(response);
   } catch (error) {
-    console.error("Queue check error:", error);
-    res.status(500).json({ error: "Failed to check queue position" });
+    logger.error("Queue check error", {
+      ip,
+      error: error.message || "Unknown error",
+    });
+    res.status(500).json({
+      error: "Failed to check queue position",
+    });
   }
 });
 
 app.get("/api/queue/status", async (req, res) => {
-  try {
-    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
-    const position = await redis.zrank(QUEUE_KEY, ip);
+  const ip = getClientIP(req);
 
-    res.json({
+  try {
+    logger.debug("Checking queue status", { ip });
+
+    const position = await redis.zrank(CONSTANTS.QUEUE_KEY, ip);
+    const response = {
       position: position || 0,
-      estimatedWaitTime: (position || 0) * 30,
+      estimatedWaitTime: (position || 0) * CONSTANTS.ESTIMATE_PER_POSITION,
       timestamp: Date.now(),
-    });
+    };
+
+    res.json(response);
   } catch (error) {
-    console.error("Queue status error:", error);
-    res.status(500).json({ error: "Failed to get queue status" });
+    logger.error("Queue status error", {
+      ip,
+      error: error.message || "Unknown error",
+    });
+    res.status(500).json({
+      error: "Failed to get queue status",
+    });
   }
 });
 
-// Health check
+// Health check endpoint
 app.get("/health", (req, res) => {
+  logger.debug("Health check requested");
   res.json({ status: "healthy" });
 });
 
-// Start cleanup process
+// Cleanup process
 setInterval(async () => {
   try {
-    // Remove old entries
     const now = Date.now();
-    await redis.zremrangebyscore(QUEUE_KEY, 0, now - QUEUE_TIMEOUT * 1000);
+    const removedCount = await redis.zremrangebyscore(
+      CONSTANTS.QUEUE_KEY,
+      0,
+      now - CONSTANTS.QUEUE_TIMEOUT * 1000
+    );
+
+    logger.info("Cleanup completed", {
+      removedEntries: removedCount,
+    });
   } catch (error) {
-    console.error("Cleanup error:", error);
+    logger.error("Cleanup error", {
+      error: error.message || "Unknown error",
+    });
   }
-}, 60000); // Run every minute
+}, CONSTANTS.CLEANUP_INTERVAL);
 
 // Start server
-app.listen(port, () => {
-  console.log(`Queue server running on port ${port}`);
+app.listen(CONSTANTS.PORT, () => {
+  logger.info(`Queue server running`, {
+    port: CONSTANTS.PORT,
+    environment: process.env.NODE_ENV || "development",
+  });
+});
+
+// Graceful shutdown
+process.on("SIGTERM", async () => {
+  logger.info("SIGTERM received, shutting down gracefully");
+  await redis.quit();
+  process.exit(0);
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", {
+    error: error.message,
+    stack: error.stack,
+  });
+  process.exit(1);
 });
