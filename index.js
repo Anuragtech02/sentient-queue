@@ -107,24 +107,24 @@ app.use(
 );
 
 // Rate limiting
-const limiter = rateLimit({
-  windowMs: CONSTANTS.RATE_LIMIT_WINDOW,
-  max: CONSTANTS.RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    logger.warn("Rate limit exceeded", {
-      ip: getClientIP(req),
-      path: req.path,
-    });
-    res.status(429).json({
-      error: "Too many requests, please try again later",
-      retryAfter: Math.ceil(CONSTANTS.RATE_LIMIT_WINDOW / 1000),
-    });
-  },
-});
+// const limiter = rateLimit({
+//   windowMs: CONSTANTS.RATE_LIMIT_WINDOW,
+//   max: CONSTANTS.RATE_LIMIT_MAX,
+//   standardHeaders: true,
+//   legacyHeaders: false,
+//   handler: (req, res) => {
+//     logger.warn("Rate limit exceeded", {
+//       ip: getClientIP(req),
+//       path: req.path,
+//     });
+//     res.status(429).json({
+//       error: "Too many requests, please try again later",
+//       retryAfter: Math.ceil(CONSTANTS.RATE_LIMIT_WINDOW / 1000),
+//     });
+//   },
+// });
 
-app.use(limiter);
+// app.use(limiter);
 
 // Request timeout middleware
 app.use((req, res, next) => {
