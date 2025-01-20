@@ -180,7 +180,7 @@ app.get("/api/queue/debug", async (req, res) => {
       activeUsers,
       queueLength,
       queuedUsers,
-      maxActiveUsers: MAX_ACTIVE_USERS,
+      maxActiveUsers: process.env.MAX_ACTIVE_USERS,
     });
   } catch (error) {
     res.status(500).json({ error: "Debug info failed" });
