@@ -170,6 +170,23 @@ app.get("/health", (req, res) => {
   res.json({ status: "healthy" });
 });
 
+app.get("/api/queue/debug", async (req, res) => {
+  try {
+    const activeUsers = await redis.scard(ACTIVE_IPS_KEY);
+    const queueLength = await redis.zcard(QUEUE_KEY);
+    const queuedUsers = await redis.zrange(QUEUE_KEY, 0, -1, "WITHSCORES");
+
+    res.json({
+      activeUsers,
+      queueLength,
+      queuedUsers,
+      maxActiveUsers: MAX_ACTIVE_USERS,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Debug info failed" });
+  }
+});
+
 // Cleanup process
 setInterval(async () => {
   try {
