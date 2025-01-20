@@ -1,2 +1,0 @@
-{"environment":"development","level":"info","message":"Queue server running","port":"8001","timestamp":"2025-01-20T10:18:04.664Z"}
-{"level":"info","message":"Successfully connected to Redis","timestamp":"2025-01-20T10:18:04.734Z"}

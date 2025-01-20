@@ -38,7 +38,7 @@ const CONSTANTS = {
   PORT: process.env.PORT || 8001,
   QUEUE_KEY: "ip_queue",
   ACTIVE_IPS_KEY: "active_ips",
-  MAX_ACTIVE_USERS: Number(process.env.MAX_ACTIVE_USERS) || 500,
+  MAX_ACTIVE_USERS: Number(process.env.MAX_ACTIVE_USERS) || 1,
   QUEUE_TIMEOUT: 300, // 5 minutes in seconds
   CLEANUP_INTERVAL: 60000, // 1 minute in milliseconds
   ESTIMATE_PER_POSITION: 30, // 30 seconds per position
@@ -86,56 +86,55 @@ app.use(
 
 // Helper functions
 const getClientIP = (req) => {
-  return req.ip || req.headers["x-forwarded-for"] || "unknown";
+  const forwardedFor = req.headers["x-forwarded-for"];
+  if (forwardedFor) {
+    // Get the first IP if multiple are present
+    return forwardedFor.split(",")[0].trim();
+  }
+  return req.ip || "unknown";
 };
 
 // Queue management endpoints
+// In server.js, update the /api/queue/check endpoint:
 app.post("/api/queue/check", async (req, res) => {
-  const ip = getClientIP(req);
-
   try {
-    logger.info("Checking queue position", { ip });
+    const ip = getClientIP(req);
+    logger.info(`Request from IP: ${ip}`);
 
-    // Check if IP is already active
+    // First, check if already active
     const isActive = await redis.sismember(CONSTANTS.ACTIVE_IPS_KEY, ip);
+    logger.info(`IP ${ip} active status: ${isActive}`);
+
     if (isActive) {
-      logger.debug("IP already active", { ip });
-      return res.json({ position: 0 });
+      return res.json({ position: 0, status: "active" });
     }
 
+    // Check active users count
     const activeUsers = await redis.scard(CONSTANTS.ACTIVE_IPS_KEY);
+    logger.info(
+      `Current active users: ${activeUsers}, Max allowed: ${CONSTANTS.MAX_ACTIVE_USERS}`
+    );
 
     if (activeUsers < CONSTANTS.MAX_ACTIVE_USERS) {
-      await redis.sadd(CONSTANTS.ACTIVE_IPS_KEY, ip);
-      await redis.expire(CONSTANTS.ACTIVE_IPS_KEY, CONSTANTS.QUEUE_TIMEOUT);
-      logger.info("New user added to active users", { ip });
-      return res.json({ position: 0 });
+      const added = await redis.sadd(CONSTANTS.ACTIVE_IPS_KEY, ip);
+      logger.info(`Added ${ip} to active users: ${added}`);
+      return res.json({ position: 0, status: "new_active" });
     }
 
-    // Add to queue
-    await redis.zadd(CONSTANTS.QUEUE_KEY, Date.now(), ip);
+    // User needs to be queued
+    const timestamp = Date.now();
+    await redis.zadd(CONSTANTS.QUEUE_KEY, timestamp, ip);
     const position = await redis.zrank(CONSTANTS.QUEUE_KEY, ip);
+    logger.info(`Added ${ip} to queue at position: ${position}`);
 
-    const response = {
-      position: position || 0,
-      estimatedWaitTime: (position || 0) * CONSTANTS.ESTIMATE_PER_POSITION,
-    };
-
-    logger.info("User added to queue", {
-      ip,
-      position: response.position,
-      estimatedWait: response.estimatedWaitTime,
+    return res.json({
+      position: position + 1,
+      status: "queued",
+      estimatedWaitTime: position * CONSTANTS.ESTIMATE_PER_POSITION,
     });
-
-    res.json(response);
   } catch (error) {
-    logger.error("Queue check error", {
-      ip,
-      error: error.message || "Unknown error",
-    });
-    res.status(500).json({
-      error: "Failed to check queue position",
-    });
+    logger.error(`Queue error: ${error.message}`);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -172,19 +171,27 @@ app.get("/health", (req, res) => {
 
 app.get("/api/queue/debug", async (req, res) => {
   try {
-    const activeUsers = await redis.scard(ACTIVE_IPS_KEY);
-    const queueLength = await redis.zcard(QUEUE_KEY);
-    const queuedUsers = await redis.zrange(QUEUE_KEY, 0, -1, "WITHSCORES");
+    const [activeUsers, queueLength, queuedUsers] = await Promise.all([
+      redis.smembers(CONSTANTS.ACTIVE_IPS_KEY),
+      redis.zcard(CONSTANTS.QUEUE_KEY),
+      redis.zrange(CONSTANTS.QUEUE_KEY, 0, -1, "WITHSCORES"),
+    ]);
 
     res.json({
-      activeUsers,
+      activeUsers: activeUsers.length,
+      activeIPs: activeUsers,
       queueLength,
       queuedUsers,
-      maxActiveUsers: process.env.MAX_ACTIVE_USERS,
+      maxActiveUsers: CONSTANTS.MAX_ACTIVE_USERS,
     });
   } catch (error) {
-    res.status(500).json({ error: "Debug info failed" });
+    res.status(500).json({ error: error.message });
   }
+});
+
+app.post("/api/queue/reset", async (req, res) => {
+  await redis.del(CONSTANTS.QUEUE_KEY, CONSTANTS.ACTIVE_IPS_KEY);
+  res.json({ message: "Queue reset" });
 });
 
 // Cleanup process
