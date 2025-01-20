@@ -98,7 +98,7 @@ app.use(compression()); // Compress responses
 // CORS configuration
 app.use(
   cors({
-    origin: "*", // Allow all origins for now
+    origin: "*",
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type", "x-forwarded-for"],
     credentials: true,
@@ -293,13 +293,113 @@ const cleanup = async () => {
   }
 };
 
+// Queue resolution process
+const resolveQueue = async () => {
+  try {
+    // Check current active users
+    const activeUsers = await redis.scard(CONSTANTS.ACTIVE_IPS_KEY);
+    const availableSlots = CONSTANTS.MAX_ACTIVE_USERS - activeUsers;
+
+    if (availableSlots <= 0) {
+      logger.debug("No slots available for queue resolution");
+      return;
+    }
+
+    // Get users from queue ordered by join time
+    const queuedUsers = await redis.zrange(
+      CONSTANTS.QUEUE_KEY,
+      0,
+      availableSlots - 1
+    );
+
+    if (queuedUsers.length === 0) {
+      logger.debug("No users in queue to resolve");
+      return;
+    }
+
+    logger.info(`Processing ${queuedUsers.length} users from queue`, {
+      availableSlots,
+      queuedUsers,
+    });
+
+    // Process each queued user
+    for (const ip of queuedUsers) {
+      try {
+        // Use multi to ensure atomicity
+        const multi = redis.multi();
+        multi.sadd(CONSTANTS.ACTIVE_IPS_KEY, ip);
+        multi.zrem(CONSTANTS.QUEUE_KEY, ip);
+
+        const results = await multi.exec();
+
+        if (results && results[0][1] === 1) {
+          // Check if user was successfully added to active set
+          logger.info(`User moved from queue to active`, { ip });
+        } else {
+          logger.warn(`Failed to move user from queue to active`, { ip });
+        }
+      } catch (error) {
+        logger.error(`Error processing queued user`, {
+          ip,
+          error: error.message,
+        });
+      }
+    }
+  } catch (error) {
+    logger.error(`Queue resolution error`, {
+      error: error.message,
+      stack: error.stack,
+    });
+  }
+};
+
+// Set up intervals for cleanup and queue resolution
+const QUEUE_RESOLUTION_INTERVAL =
+  Number(process.env.QUEUE_RESOLUTION_INTERVAL) || 5000; // 5 seconds
 const cleanupInterval = setInterval(cleanup, CONSTANTS.CLEANUP_INTERVAL);
+const queueResolutionInterval = setInterval(
+  resolveQueue,
+  QUEUE_RESOLUTION_INTERVAL
+);
 
 // Graceful shutdown
+// Add endpoint to remove user from active set
+app.post("/api/queue/deactivate", validateQueueCheck, async (req, res) => {
+  const ip = getClientIP(req);
+
+  try {
+    const removed = await redis.srem(CONSTANTS.ACTIVE_IPS_KEY, ip);
+    logger.info(`User deactivation request`, { ip, removed });
+
+    res.json({
+      success: removed === 1,
+      message:
+        removed === 1 ? "User deactivated" : "User not found in active set",
+    });
+
+    // Trigger immediate queue resolution if user was removed
+    if (removed === 1) {
+      resolveQueue().catch((error) => {
+        logger.error("Error in queue resolution after deactivation", {
+          error: error.message,
+        });
+      });
+    }
+  } catch (error) {
+    logger.error(`Deactivation error`, {
+      ip,
+      error: error.message,
+      stack: error.stack,
+    });
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 const gracefulShutdown = async (signal) => {
   logger.info(`${signal} received, starting graceful shutdown`);
 
   clearInterval(cleanupInterval);
+  clearInterval(queueResolutionInterval);
 
   // Give active requests 10 seconds to complete
   setTimeout(() => {
