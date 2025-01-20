@@ -62,7 +62,7 @@ redis.on("error", (err) => {
 app.use(express.json());
 app.use(
   cors({
-    origin: process.env.NEXTJS_URL || "http://localhost:3000",
+    origin: ["*"],
     credentials: true,
   })
 );
