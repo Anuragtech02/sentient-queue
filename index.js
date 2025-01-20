@@ -127,10 +127,20 @@ app.use(
 // app.use(limiter);
 
 // Request timeout middleware
+// app.use((req, res, next) => {
+//   res.setTimeout(CONSTANTS.REQUEST_TIMEOUT, () => {
+//     logger.error("Request timeout", { path: req.path, ip: getClientIP(req) });
+//     res.status(408).json({ error: "Request timeout" });
+//   });
+//   next();
+// });
+
 app.use((req, res, next) => {
-  res.setTimeout(CONSTANTS.REQUEST_TIMEOUT, () => {
-    logger.error("Request timeout", { path: req.path, ip: getClientIP(req) });
-    res.status(408).json({ error: "Request timeout" });
+  logger.info(`Incoming request`, {
+    method: req.method,
+    path: req.path,
+    ip: getClientIP(req),
+    headers: req.headers,
   });
   next();
 });
@@ -153,6 +163,10 @@ const validateQueueCheck = (req, res, next) => {
   }
   next();
 };
+
+app.get("/", (req, res) => {
+  res.json({ message: "Queue service running" });
+});
 
 // Queue management endpoints
 app.post("/api/queue/check", validateQueueCheck, async (req, res) => {
@@ -393,6 +407,23 @@ app.post("/api/queue/deactivate", validateQueueCheck, async (req, res) => {
     });
     res.status(500).json({ error: "Internal server error" });
   }
+});
+
+app.use((err, req, res, next) => {
+  logger.error("Unhandled error", {
+    error: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+    ip: getClientIP(req),
+  });
+
+  res.status(500).json({
+    error:
+      process.env.NODE_ENV === "production"
+        ? "Internal server error"
+        : err.message,
+  });
 });
 
 const gracefulShutdown = async (signal) => {
