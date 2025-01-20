@@ -5,17 +5,32 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { config as configDotenv } from "dotenv";
 import winston from "winston";
+import helmet from "helmet";
+import compression from "compression";
 
-// Initialize environment variables
-configDotenv();
+// Initialize environment variables based on NODE_ENV
+configDotenv({ path: `.env.${process.env.NODE_ENV || "local"}` });
 
-// Configure Winston logger
+// Validate required environment variables
+const requiredEnvVars = ["REDIS_URL", "MAX_ACTIVE_USERS"];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
+
+// Configure Winston logger with production settings
 const logger = winston.createLogger({
-  level: process.env.LOG_LEVEL || "info",
+  level:
+    process.env.LOG_LEVEL ||
+    (process.env.NODE_ENV === "production" ? "info" : "debug"),
   format: winston.format.combine(
     winston.format.timestamp(),
+    winston.format.errors({ stack: true }),
     winston.format.json()
   ),
+  defaultMeta: { service: "queue-service" },
   transports: [
     new winston.transports.Console({
       format: winston.format.combine(
@@ -24,31 +39,48 @@ const logger = winston.createLogger({
       ),
     }),
     new winston.transports.File({
-      filename: "error.log",
+      filename: "logs/error.log",
       level: "error",
+      maxsize: 5242880, // 5MB
+      maxFiles: 5,
     }),
     new winston.transports.File({
-      filename: "combined.log",
+      filename: "logs/combined.log",
+      maxsize: 5242880, // 5MB
+      maxFiles: 5,
     }),
   ],
 });
 
-// Constants
+// Constants with environment variable fallbacks
 const CONSTANTS = {
   PORT: process.env.PORT || 8001,
   QUEUE_KEY: "ip_queue",
   ACTIVE_IPS_KEY: "active_ips",
-  MAX_ACTIVE_USERS: Number(process.env.MAX_ACTIVE_USERS) || 1,
-  QUEUE_TIMEOUT: 300, // 5 minutes in seconds
-  CLEANUP_INTERVAL: 60000, // 1 minute in milliseconds
-  ESTIMATE_PER_POSITION: 30, // 30 seconds per position
+  MAX_ACTIVE_USERS: Number(process.env.MAX_ACTIVE_USERS),
+  QUEUE_TIMEOUT: Number(process.env.QUEUE_TIMEOUT) || 300, // 5 minutes in seconds
+  CLEANUP_INTERVAL: Number(process.env.CLEANUP_INTERVAL) || 60000, // 1 minute in milliseconds
+  ESTIMATE_PER_POSITION: Number(process.env.ESTIMATE_PER_POSITION) || 30, // 30 seconds per position
+  ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(",")
+    : ["http://localhost:3000"],
+  RATE_LIMIT_WINDOW: Number(process.env.RATE_LIMIT_WINDOW) || 60000, // 1 minute
+  RATE_LIMIT_MAX: Number(process.env.RATE_LIMIT_MAX) || 30, // requests per window
+  REQUEST_TIMEOUT: Number(process.env.REQUEST_TIMEOUT) || 5000, // 5 seconds
 };
 
 // Express app initialization
 const app = express();
 
-// Redis setup
-const redis = new Redis(process.env.REDIS_URL || "");
+// Redis setup with error handling
+const redis = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: 3,
+  enableReadyCheck: true,
+  retryStrategy(times) {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  },
+});
 
 redis.on("connect", () => {
   logger.info("Successfully connected to Redis");
@@ -59,73 +91,105 @@ redis.on("error", (err) => {
 });
 
 // Middleware setup
-app.use(express.json());
+app.use(express.json({ limit: "10kb" })); // Limit payload size
+app.use(helmet()); // Security headers
+app.use(compression()); // Compress responses
+
+// CORS configuration
 app.use(
   cors({
-    origin: "*",
+    origin: "*", // Allow all origins for now
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type", "x-forwarded-for"],
     credentials: true,
+    maxAge: 86400, // CORS preflight cache 24 hours
   })
 );
 
 // Rate limiting
-// const limiter = rateLimit({
-//   windowMs: 60 * 1000, // 1 minute
-//   max: 30, // 30 requests per minute
-//   handler: (req, res) => {
-//     logger.warn("Rate limit exceeded", {
-//       ip: req.ip,
-//       path: req.path,
-//     });
-//     res.status(429).json({
-//       error: "Too many requests, please try again later",
-//     });
-//   },
-// });
+const limiter = rateLimit({
+  windowMs: CONSTANTS.RATE_LIMIT_WINDOW,
+  max: CONSTANTS.RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    logger.warn("Rate limit exceeded", {
+      ip: getClientIP(req),
+      path: req.path,
+    });
+    res.status(429).json({
+      error: "Too many requests, please try again later",
+      retryAfter: Math.ceil(CONSTANTS.RATE_LIMIT_WINDOW / 1000),
+    });
+  },
+});
 
-// app.use(limiter);
+app.use(limiter);
+
+// Request timeout middleware
+app.use((req, res, next) => {
+  res.setTimeout(CONSTANTS.REQUEST_TIMEOUT, () => {
+    logger.error("Request timeout", { path: req.path, ip: getClientIP(req) });
+    res.status(408).json({ error: "Request timeout" });
+  });
+  next();
+});
 
 // Helper functions
 const getClientIP = (req) => {
   const forwardedFor = req.headers["x-forwarded-for"];
   if (forwardedFor) {
-    // Get the first IP if multiple are present
     return forwardedFor.split(",")[0].trim();
   }
   return req.ip || "unknown";
 };
 
+// Input validation middleware
+const validateQueueCheck = (req, res, next) => {
+  const ip = getClientIP(req);
+  if (!ip || ip === "unknown") {
+    logger.error("Invalid IP address in request");
+    return res.status(400).json({ error: "Invalid IP address" });
+  }
+  next();
+};
+
 // Queue management endpoints
-// In server.js, update the /api/queue/check endpoint:
-app.post("/api/queue/check", async (req, res) => {
+app.post("/api/queue/check", validateQueueCheck, async (req, res) => {
+  const ip = getClientIP(req);
+  const startTime = Date.now();
+
   try {
-    const ip = getClientIP(req);
-    logger.info(`Request from IP: ${ip}`);
+    logger.info(`Queue check request`, { ip });
 
-    // First, check if already active
     const isActive = await redis.sismember(CONSTANTS.ACTIVE_IPS_KEY, ip);
-    logger.info(`IP ${ip} active status: ${isActive}`);
-
     if (isActive) {
+      logger.debug(`IP already active`, { ip });
       return res.json({ position: 0, status: "active" });
     }
 
-    // Check active users count
     const activeUsers = await redis.scard(CONSTANTS.ACTIVE_IPS_KEY);
-    logger.info(
-      `Current active users: ${activeUsers}, Max allowed: ${CONSTANTS.MAX_ACTIVE_USERS}`
-    );
+    logger.debug(`Active users check`, {
+      ip,
+      activeUsers,
+      maxAllowed: CONSTANTS.MAX_ACTIVE_USERS,
+    });
 
     if (activeUsers < CONSTANTS.MAX_ACTIVE_USERS) {
       const added = await redis.sadd(CONSTANTS.ACTIVE_IPS_KEY, ip);
-      logger.info(`Added ${ip} to active users: ${added}`);
+      logger.info(`New active user added`, { ip, added });
       return res.json({ position: 0, status: "new_active" });
     }
 
-    // User needs to be queued
     const timestamp = Date.now();
     await redis.zadd(CONSTANTS.QUEUE_KEY, timestamp, ip);
     const position = await redis.zrank(CONSTANTS.QUEUE_KEY, ip);
-    logger.info(`Added ${ip} to queue at position: ${position}`);
+
+    logger.info(`User queued`, {
+      ip,
+      position: position + 1,
+      queueTime: Date.now() - startTime,
+    });
 
     return res.json({
       position: position + 1,
@@ -133,17 +197,19 @@ app.post("/api/queue/check", async (req, res) => {
       estimatedWaitTime: position * CONSTANTS.ESTIMATE_PER_POSITION,
     });
   } catch (error) {
-    logger.error(`Queue error: ${error.message}`);
-    res.status(500).json({ error: error.message });
+    logger.error(`Queue check error`, {
+      ip,
+      error: error.message,
+      stack: error.stack,
+    });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.get("/api/queue/status", async (req, res) => {
+app.get("/api/queue/status", validateQueueCheck, async (req, res) => {
   const ip = getClientIP(req);
 
   try {
-    logger.debug("Checking queue status", { ip });
-
     const position = await redis.zrank(CONSTANTS.QUEUE_KEY, ip);
     const response = {
       position: position || 0,
@@ -151,25 +217,25 @@ app.get("/api/queue/status", async (req, res) => {
       timestamp: Date.now(),
     };
 
+    logger.debug(`Queue status check`, { ip, ...response });
     res.json(response);
   } catch (error) {
-    logger.error("Queue status error", {
+    logger.error(`Queue status error`, {
       ip,
-      error: error.message || "Unknown error",
+      error: error.message,
+      stack: error.stack,
     });
-    res.status(500).json({
-      error: "Failed to get queue status",
-    });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Health check endpoint
-app.get("/health", (req, res) => {
-  logger.debug("Health check requested");
-  res.json({ status: "healthy" });
-});
-
 app.get("/api/queue/debug", async (req, res) => {
+  if (process.env.NODE_ENV === "production") {
+    return res
+      .status(403)
+      .json({ error: "Debug endpoint disabled in production" });
+  }
+
   try {
     const [activeUsers, queueLength, queuedUsers] = await Promise.all([
       redis.smembers(CONSTANTS.ACTIVE_IPS_KEY),
@@ -183,19 +249,28 @@ app.get("/api/queue/debug", async (req, res) => {
       queueLength,
       queuedUsers,
       maxActiveUsers: CONSTANTS.MAX_ACTIVE_USERS,
+      timestamp: Date.now(),
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error(`Debug endpoint error`, {
+      error: error.message,
+      stack: error.stack,
+    });
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.post("/api/queue/reset", async (req, res) => {
-  await redis.del(CONSTANTS.QUEUE_KEY, CONSTANTS.ACTIVE_IPS_KEY);
-  res.json({ message: "Queue reset" });
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: Date.now(),
+    version: process.env.npm_package_version,
+  });
 });
 
 // Cleanup process
-setInterval(async () => {
+const cleanup = async () => {
   try {
     const now = Date.now();
     const removedCount = await redis.zremrangebyscore(
@@ -204,35 +279,70 @@ setInterval(async () => {
       now - CONSTANTS.QUEUE_TIMEOUT * 1000
     );
 
-    logger.info("Cleanup completed", {
-      removedEntries: removedCount,
-    });
+    if (removedCount > 0) {
+      logger.info(`Queue cleanup completed`, {
+        removedEntries: removedCount,
+        timestamp: now,
+      });
+    }
   } catch (error) {
-    logger.error("Cleanup error", {
-      error: error.message || "Unknown error",
+    logger.error(`Queue cleanup error`, {
+      error: error.message,
+      stack: error.stack,
     });
   }
-}, CONSTANTS.CLEANUP_INTERVAL);
+};
+
+const cleanupInterval = setInterval(cleanup, CONSTANTS.CLEANUP_INTERVAL);
+
+// Graceful shutdown
+const gracefulShutdown = async (signal) => {
+  logger.info(`${signal} received, starting graceful shutdown`);
+
+  clearInterval(cleanupInterval);
+
+  // Give active requests 10 seconds to complete
+  setTimeout(() => {
+    logger.error("Forced shutdown after timeout");
+    process.exit(1);
+  }, 10000);
+
+  try {
+    await redis.quit();
+    logger.info("Redis connection closed");
+    process.exit(0);
+  } catch (error) {
+    logger.error("Error during shutdown", { error: error.message });
+    process.exit(1);
+  }
+};
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // Start server
 app.listen(CONSTANTS.PORT, () => {
   logger.info(`Queue server running`, {
     port: CONSTANTS.PORT,
     environment: process.env.NODE_ENV || "development",
+    maxActiveUsers: CONSTANTS.MAX_ACTIVE_USERS,
+    version: process.env.npm_package_version,
   });
 });
 
-// Graceful shutdown
-process.on("SIGTERM", async () => {
-  logger.info("SIGTERM received, shutting down gracefully");
-  await redis.quit();
-  process.exit(0);
-});
-
+// Global error handler
 process.on("uncaughtException", (error) => {
-  logger.error("Uncaught exception", {
+  logger.error(`Uncaught exception`, {
     error: error.message,
     stack: error.stack,
   });
-  process.exit(1);
+  // Give logger time to write before exiting
+  setTimeout(() => process.exit(1), 1000);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error(`Unhandled rejection`, {
+    reason: reason instanceof Error ? reason.message : reason,
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
 });
