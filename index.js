@@ -62,27 +62,27 @@ redis.on("error", (err) => {
 app.use(express.json());
 app.use(
   cors({
-    origin: ["*"],
+    origin: "*",
     credentials: true,
   })
 );
 
 // Rate limiting
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 30, // 30 requests per minute
-  handler: (req, res) => {
-    logger.warn("Rate limit exceeded", {
-      ip: req.ip,
-      path: req.path,
-    });
-    res.status(429).json({
-      error: "Too many requests, please try again later",
-    });
-  },
-});
+// const limiter = rateLimit({
+//   windowMs: 60 * 1000, // 1 minute
+//   max: 30, // 30 requests per minute
+//   handler: (req, res) => {
+//     logger.warn("Rate limit exceeded", {
+//       ip: req.ip,
+//       path: req.path,
+//     });
+//     res.status(429).json({
+//       error: "Too many requests, please try again later",
+//     });
+//   },
+// });
 
-app.use(limiter);
+// app.use(limiter);
 
 // Helper functions
 const getClientIP = (req) => {
