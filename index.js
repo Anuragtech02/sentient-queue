@@ -3,12 +3,23 @@ import express from "express";
 import Redis from "ioredis";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
+import { configDotenv } from "dotenv";
+
+configDotenv();
 
 const app = express();
-const port = process.env.PORT || 5000;
+const port = process.env.PORT || 8001;
 
 // Redis setup
 const redis = new Redis(process.env.REDIS_URL || "");
+
+redis.on("connect", () => {
+  console.log("Successfully connected to Redis");
+});
+
+redis.on("error", (err) => {
+  console.error("Redis connection error:", err);
+});
 
 // Constants
 const QUEUE_KEY = "ip_queue";
